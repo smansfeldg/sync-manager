@@ -1,0 +1,19 @@
+name: Call central sync (develop -> Bitbucket)
+
+on:
+  push:
+    branches:
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  call-central:
+    uses: OWNER/sync-manager/.github/workflows/reusable-sync.yml@main
+    with:
+      branch: ${{ github.ref }}
+    secrets:
+      BITBUCKET_USER: ${{ secrets.BITBUCKET_USER }}
+      BITBUCKET_PAT: ${{ secrets.BITBUCKET_PAT }}
+      BITBUCKET_REPO_URL: ${{ secrets.BITBUCKET_REPO_URL }}

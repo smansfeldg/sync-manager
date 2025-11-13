@@ -1,0 +1,133 @@
+name: Reusable Sync to Bitbucket
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+        description: The branch reference to sync (e.g., refs/heads/develop)
+    secrets:
+      BITBUCKET_USER:
+        required: true
+      BITBUCKET_PAT:
+        required: true
+      BITBUCKET_REPO_URL:
+        required: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+
+      - name: Extract and validate branch name
+        id: branch
+        run: |
+          BRANCH="${{ inputs.branch }}"
+          
+          # Extraer nombre de rama de refs/heads/
+          if echo "$BRANCH" | grep -q '^refs/heads/'; then
+            BRANCH=$(echo "$BRANCH" | sed 's#refs/heads/##')
+          fi
+          
+          # Validar nombre de rama
+          if [ -z "$BRANCH" ]; then
+            echo "Error: El nombre de la rama está vacío." >&2
+            exit 1
+          fi
+          
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Rama detectada: $BRANCH"
+
+      - name: Skip protected branches
+        id: check_branch
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          
+          # Lista de ramas protegidas que no se sincronizan
+          PROTECTED_BRANCHES=("main" "master")
+          
+          for protected in "${PROTECTED_BRANCHES[@]}"; do
+            if [ "$BRANCH" = "$protected" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "La rama '$BRANCH' está protegida y no se sincronizará con Bitbucket."
+              exit 0
+            fi
+          done
+          
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "La rama '$BRANCH' será sincronizada."
+
+      - name: Validate Bitbucket credentials
+        if: steps.check_branch.outputs.skip == 'false'
+        env:
+          BB_USER: ${{ secrets.BITBUCKET_USER }}
+          BB_PAT: ${{ secrets.BITBUCKET_PAT }}
+          BB_REPO_URL: ${{ secrets.BITBUCKET_REPO_URL }}
+        run: |
+          if [ -z "$BB_USER" ] || [ -z "$BB_PAT" ] || [ -z "$BB_REPO_URL" ]; then
+            echo "Error: Las credenciales de Bitbucket están incompletas." >&2
+            exit 1
+          fi
+          
+          # Validar formato de URL
+          if [[ "$BB_REPO_URL" =~ ^https?:// ]]; then
+            echo "Error: BITBUCKET_REPO_URL no debe incluir el protocolo." >&2
+            exit 1
+          fi
+          
+          echo "Credenciales validadas correctamente."
+
+      - name: Push to Bitbucket
+        if: steps.check_branch.outputs.skip == 'false'
+        env:
+          BB_USER: ${{ secrets.BITBUCKET_USER }}
+          BB_PAT: ${{ secrets.BITBUCKET_PAT }}
+          BB_REPO_URL: ${{ secrets.BITBUCKET_REPO_URL }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          # Construir URL con credenciales
+          BB_URL="https://${BB_USER}:${BB_PAT}@${BB_REPO_URL}"
+          
+          echo "Sincronizando rama '$BRANCH' hacia Bitbucket..."
+          echo "Destino: $BB_REPO_URL"
+          
+          # Agregar remote de Bitbucket
+          git remote add bitbucket "$BB_URL"
+          
+          # Push con retry básico
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if git push bitbucket "$BRANCH:$BRANCH" 2>&1; then
+              echo "✅ Sincronización exitosa de la rama '$BRANCH'."
+              exit 0
+            else
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⚠️  Intento $RETRY_COUNT falló. Reintentando en 5 segundos..."
+                sleep 5
+              fi
+            fi
+          done
+          
+          echo "Error: No se pudo sincronizar después de $MAX_RETRIES intentos." >&2
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Remover remote para evitar exponer credenciales en logs
+          git remote remove bitbucket 2>/dev/null || true

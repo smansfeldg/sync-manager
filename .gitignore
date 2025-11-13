@@ -1,0 +1,28 @@
+# Archivos temporales
+*.tmp
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Variables de entorno locales
+.env
+.env.local
+
+# Directorios de caché
+.cache/
+
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
+
+# IDEs y editores
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Backups de scripts
+*.bak
