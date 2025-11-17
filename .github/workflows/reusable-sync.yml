@@ -19,7 +19,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    
+
     steps:
       - name: Checkout source repo
         uses: actions/checkout@v4
@@ -34,30 +34,24 @@ jobs:
       - name: Extract and validate branch name
         id: branch
         run: |
+          set -euo pipefail
           BRANCH="${{ inputs.branch }}"
-          
-          # Extraer nombre de rama de refs/heads/
           if echo "$BRANCH" | grep -q '^refs/heads/'; then
             BRANCH=$(echo "$BRANCH" | sed 's#refs/heads/##')
           fi
-          
-          # Validar nombre de rama
           if [ -z "$BRANCH" ]; then
             echo "Error: El nombre de la rama está vacío." >&2
             exit 1
           fi
-          
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "Rama detectada: $BRANCH"
 
       - name: Skip protected branches
         id: check_branch
         run: |
+          set -euo pipefail
           BRANCH="${{ steps.branch.outputs.branch }}"
-          
-          # Lista de ramas protegidas que no se sincronizan
           PROTECTED_BRANCHES=("main" "master")
-          
           for protected in "${PROTECTED_BRANCHES[@]}"; do
             if [ "$BRANCH" = "$protected" ]; then
               echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -65,7 +59,6 @@ jobs:
               exit 0
             fi
           done
-          
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "La rama '$BRANCH' será sincronizada."
 
@@ -76,20 +69,18 @@ jobs:
           BB_PAT: ${{ secrets.BITBUCKET_PAT }}
           BB_REPO_URL: ${{ secrets.BITBUCKET_REPO_URL }}
         run: |
+          set -euo pipefail
           if [ -z "$BB_USER" ] || [ -z "$BB_PAT" ] || [ -z "$BB_REPO_URL" ]; then
             echo "Error: Las credenciales de Bitbucket están incompletas." >&2
             exit 1
           fi
-          
-          # Validar formato de URL
           if [[ "$BB_REPO_URL" =~ ^https?:// ]]; then
             echo "Error: BITBUCKET_REPO_URL no debe incluir el protocolo." >&2
             exit 1
           fi
-          
           echo "Credenciales validadas correctamente."
 
-      - name: Push to Bitbucket
+      - name: Push to Bitbucket (overwrite on conflict)
         if: steps.check_branch.outputs.skip == 'false'
         env:
           BB_USER: ${{ secrets.BITBUCKET_USER }}
@@ -97,34 +88,65 @@ jobs:
           BB_REPO_URL: ${{ secrets.BITBUCKET_REPO_URL }}
           BRANCH: ${{ steps.branch.outputs.branch }}
         run: |
-          # Construir URL con credenciales
+          set -euo pipefail
           BB_URL="https://${BB_USER}:${BB_PAT}@${BB_REPO_URL}"
-          
-          echo "Sincronizando rama '$BRANCH' hacia Bitbucket..."
-          echo "Destino: $BB_REPO_URL"
-          
-          # Agregar remote de Bitbucket
-          git remote add bitbucket "$BB_URL"
-          
-          # Push con retry básico
+          REMOTE_NAME="bitbucket"
           MAX_RETRIES=3
+          SLEEP_SECS=5
+
+          echo "Sincronizando rama '$BRANCH' hacia Bitbucket..."
+          # Agregar remote (si existe, actualizar URL)
+          if git remote get-url "$REMOTE_NAME" >/dev/null 2>&1; then
+            git remote set-url "$REMOTE_NAME" "$BB_URL"
+          else
+            git remote add "$REMOTE_NAME" "$BB_URL"
+          fi
+
+          # Intento de push normal con reintentos
           RETRY_COUNT=0
-          
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if git push bitbucket "$BRANCH:$BRANCH" 2>&1; then
+            if git push "$REMOTE_NAME" "HEAD:${BRANCH}" 2>&1; then
               echo "✅ Sincronización exitosa de la rama '$BRANCH'."
               exit 0
             else
               RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "⚠️  Intento $RETRY_COUNT falló."
+              # si aún quedan reintentos, esperar y reintentar
               if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                echo "⚠️  Intento $RETRY_COUNT falló. Reintentando en 5 segundos..."
-                sleep 5
+                echo "Reintentando en $SLEEP_SECS segundos..."
+                sleep "$SLEEP_SECS"
               fi
             fi
           done
-          
-          echo "Error: No se pudo sincronizar después de $MAX_RETRIES intentos." >&2
-          exit 1
+
+          echo "El push normal falló después de $MAX_RETRIES intentos. Revisando si hay conflicto (non-fast-forward)..."
+
+          # Traer refs remotas
+          git fetch "$REMOTE_NAME" --depth=1 || true
+
+          # Comprobar si la rama existe en remoto
+          if git show-ref --verify --quiet "refs/remotes/${REMOTE_NAME}/${BRANCH}"; then
+            TIMESTAMP=$(date +%s)
+            BACKUP_REF="backup/${BRANCH}-${TIMESTAMP}"
+            echo "La rama remota existe. Creando backup en remoto: refs/heads/${BACKUP_REF}"
+            # Crear backup remoto: empujar la referencia remota a una nueva rama backup
+            # Esto copia lo que hay en bitbucket/${BRANCH} a heads/backup/...
+            git push "$REMOTE_NAME" "refs/remotes/${REMOTE_NAME}/${BRANCH}:refs/heads/${BACKUP_REF}" || {
+              echo "Advertencia: no se pudo crear backup remoto. Continuando con el forzado."
+            }
+          else
+            echo "No existe la rama remota ${REMOTE_NAME}/${BRANCH} (es nueva). No se necesita backup."
+          fi
+
+          # Forzar push seguro (force-with-lease) para sobrescribir el remoto con lo local
+          echo "Sobrescribiendo la rama remota con la rama local usando --force-with-lease..."
+          if git push "$REMOTE_NAME" "HEAD:${BRANCH}" --force-with-lease; then
+            echo "✅ Push forzado exitoso. La rama remota ahora coincide con la local."
+            exit 0
+          else
+            echo "Error: El push forzado falló." >&2
+            exit 1
+          fi
 
       - name: Cleanup
         if: always()
